@@ -520,7 +520,7 @@ if __name__ == '__main__':
                 
                 eval_start = Time.time()
                 print('-------------------------- VAL PHRASE --------------------------')
-                _ = evaluate(model, 'val_data.df', diff, device)
+                _ = evaluate(model, 'valid_data.df', diff, device)
                 print('-------------------------- TEST PHRASE -------------------------')
                 _ = evaluate(model, 'test_data.df', diff, device)
                 print("Evalution cost: " + Time.strftime("%H: %M: %S", Time.gmtime(Time.time()-eval_start)))

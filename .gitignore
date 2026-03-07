@@ -1,1 +1,9 @@
 geoip.db
+/datasets
+datasets.zip
+__pycache__/
+outputs/
+*.log
+wandb/
+datasets/
+

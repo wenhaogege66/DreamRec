@@ -1,3 +1,15 @@
+  cd DreamRec
+  python -u DreamRec.py --data yelp --timesteps 500 --lr 0.001 \
+    --beta_sche exp --w 2 --optimizer adamw --diffuser_type mlp1 --random_seed 100
+
+  - PAD token = item_num (yc用9514, yelp用20033)                                                                                               
+  - 序列格式: [有效items][PAD...],len_seq记录有效item数量
+  - 所有4列(seq, len_seq, next)格式匹配  
+
+  - train_data.df: 200,146个样本
+  - valid_data.df: 28,592个样本
+  - test_data.df: 57,185个样本
+
 # DreamRec
 
 This is the implementation of our NeurIPS 2023 paper:
