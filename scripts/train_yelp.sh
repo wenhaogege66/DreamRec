@@ -31,7 +31,7 @@ echo "=================================================="
 DATA="yelp"                   # 数据集名称，对应 data/{DATA}/ 目录
 
 # --- 训练流程 ---
-EPOCH=1000                    # 最大训练轮数
+EPOCH=100                    # 最大训练轮数
 BATCH_SIZE=256                # mini-batch 大小
 RANDOM_SEED=100               # 随机种子（影响参数初始化、batch采样等）
 
@@ -44,8 +44,8 @@ DIFFUSER_TYPE="mlp1"          # 去噪网络结构:
 # LAYERS=1                    # 定义了但代码未使用（Transformer固定单层），无需设置
 
 # --- 正则与dropout ---
-DROPOUT_RATE=0.1              # Transformer 中的 dropout 概率（attention + FFN + embedding）
-L2_DECAY=0                    # 优化器的 weight decay（L2正则系数），0表示不正则化
+DROPOUT_RATE=0.15              # Transformer 中的 dropout 概率（attention + FFN + embedding）
+L2_DECAY=1e-4                    # 优化器的 weight decay（L2正则系数），0表示不正则化
 
 # --- 优化器 ---
 OPTIMIZER="adamw"             # 优化器类型: adam / adamw / adagrad / rmsprop
@@ -63,21 +63,27 @@ BETA_START=0.0001             # 仅 linear 调度时生效，beta 起始值
 BETA_END=0.02                 # 仅 linear 调度时生效，beta 终止值
 
 # --- Classifier-Free Guidance ---
-W=2                           # 引导强度 w:
-                              #   最终预测 = (1+w)*条件预测 - w*无条件预测
-                              #   越大越强调用户历史，但过大会过拟合
-                              #   论文推荐: yc/ks=2, zhihu=4
-P=0.1                         # 训练时 context dropout 概率:
-                              #   以概率 p 将历史 context 替换为 null embedding
-                              #   使模型同时学习有/无条件两种情况（CFG训练的关键）
+W=2                           # 引导强度 w
+P=0.1                         # 训练时 context dropout 概率
+
+# --- DDBC 兼容评估 ---
+PREDICT_NUMS="3,5"          # 每次预测的 item 数，对应 DDBC 的 predict_num_items
+CANDIDATE_MULTIPLIERS="9,19,49,99"
+                              # 候选集倍数: pool_size = 1 + multiplier
+                              # x9→10候选, x19→20候选, x49→50候选, x99→100候选
+                              # 与 DDBC 的 test_candidates_seed*_x*_items*.pkl 对齐
+EVAL_FREQ=10                  # 每隔多少 epoch 做一次 DDBC 评估
 
 # =============================================================================
 # 开始训练
 # =============================================================================
 
 LOG_FILE="$OUTPUT_DIR/train.log"
+TB_LOG_DIR="$PROJECT_DIR/tensorboard/$DATA/$RUN_NAME"
+SAVE_DIR="$OUTPUT_DIR"
 
 echo "Logging to: $LOG_FILE"
+echo "TensorBoard: $TB_LOG_DIR"
 echo ""
 
 python -u "$PROJECT_DIR/DreamRec.py" \
@@ -97,8 +103,13 @@ python -u "$PROJECT_DIR/DreamRec.py" \
     --beta_end      $BETA_END       \
     --w             $W              \
     --p             $P              \
-    --cuda          $CUDA_VISIBLE_DEVICES \
-    --descri        "$RUN_NAME"     \
+    --predict_nums  "$PREDICT_NUMS"          \
+    --candidate_multipliers "$CANDIDATE_MULTIPLIERS" \
+    --eval_freq     $EVAL_FREQ               \
+    --tb_log_dir    "$TB_LOG_DIR"            \
+    --save_dir      "$SAVE_DIR"              \
+    --cuda          $CUDA_VISIBLE_DEVICES    \
+    --descri        "$RUN_NAME"              \
     2>&1 | tee "$LOG_FILE"
 
 echo ""

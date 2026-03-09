@@ -3,10 +3,12 @@ import pandas as pd
 import math
 import random
 import argparse
+import pickle
 import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.optim.lr_scheduler as lr_scheduler
+from torch.utils.tensorboard import SummaryWriter
 import os
 import logging
 import time as Time
@@ -59,6 +61,17 @@ def parse_args():
                         help='')
     parser.add_argument('--descri', type=str, default='',
                         help='description of the work.')
+    # --- DDBC-compatible evaluation ---
+    parser.add_argument('--predict_nums', type=str, default='1,3,5',
+                        help='Comma-separated list of top-k items to predict, e.g. "1,3,5"')
+    parser.add_argument('--candidate_multipliers', type=str, default='9,19,49,99',
+                        help='Comma-separated candidate multipliers; pool_size = 1 + multiplier')
+    parser.add_argument('--eval_freq', type=int, default=10,
+                        help='Run DDBC-style evaluation every N epochs')
+    parser.add_argument('--tb_log_dir', type=str, default='',
+                        help='TensorBoard log directory (default: ./tensorboard/{data}/{descri})')
+    parser.add_argument('--save_dir', type=str, default='',
+                        help='Directory to save best model (default: ./outputs/{data}/)')
     return parser.parse_args()
 
 args = parse_args()
@@ -216,7 +229,7 @@ class diffusion():
         # x = torch.randn_like(h) / 100
 
         for n in reversed(range(0, self.timesteps)):
-            x = self.p_sample(model_forward, model_forward_uncon, x, h, torch.full((h.shape[0], ), n, device=device, dtype=torch.long), n)
+            x = self.p_sample(model_forward, model_forward_uncon, x, h, torch.full((h.shape[0], ), n, device=h.device, dtype=torch.long), n)
 
         return x
 
@@ -364,8 +377,17 @@ class Tenc(nn.Module):
 
         return h  
     
-    def predict(self, states, len_states, diff):
-        #hidden
+    def predict(self, states, len_states, diff, candidate_ids=None):
+        """
+        Args:
+            states:        [B, seq_size] LongTensor
+            len_states:    [B] numpy array
+            diff:          diffusion object
+            candidate_ids: None → score full item pool (original behavior)
+                           [B, n_cand] LongTensor → score only these candidates per sample
+        Returns:
+            scores: [B, n_items] or [B, n_cand]
+        """
         inputs_emb = self.item_embeddings(states)
         inputs_emb += self.positional_embeddings(torch.arange(self.state_size).to(self.device))
         seq = self.emb_dropout(inputs_emb)
@@ -380,151 +402,364 @@ class Tenc(nn.Module):
         h = state_hidden.squeeze()
 
         x = diff.sample(self.forward, self.forward_uncon, h)
-        
-        test_item_emb = self.item_embeddings.weight
-        scores = torch.matmul(x, test_item_emb.transpose(0, 1))
+
+        if candidate_ids is not None:
+            # candidate_ids: [B, n_cand]
+            # cand_emb:      [B, n_cand, H]
+            cand_emb = self.item_embeddings(candidate_ids)
+            scores = torch.bmm(cand_emb, x.unsqueeze(-1)).squeeze(-1)  # [B, n_cand]
+        else:
+            test_item_emb = self.item_embeddings.weight
+            scores = torch.matmul(x, test_item_emb.transpose(0, 1))
 
         return scores
 
 
 
 def evaluate(model, test_data, diff, device):
+    """原始 HR/NDCG 评估（对全量item pool打分），仅用于快速监控，不作为最终指标。"""
     eval_data=pd.read_pickle(os.path.join(data_directory, test_data))
 
     batch_size = 100
-    evaluated=0
-    total_clicks=1.0
     total_purchase = 0.0
-    total_reward = [0, 0, 0, 0]
-    hit_clicks=[0,0,0,0]
-    ndcg_clicks=[0,0,0,0]
     hit_purchase=[0,0,0,0]
     ndcg_purchase=[0,0,0,0]
 
     seq, len_seq, target = list(eval_data['seq'].values), list(eval_data['len_seq'].values), list(eval_data['next'].values)
-
-
     num_total = len(seq)
 
     for i in range(num_total // batch_size):
         seq_b, len_seq_b, target_b = seq[i * batch_size: (i + 1)* batch_size], len_seq[i * batch_size: (i + 1)* batch_size], target[i * batch_size: (i + 1)* batch_size]
-        states = np.array(seq_b)
-        states = torch.LongTensor(states)
-        states = states.to(device)
-
+        states = torch.LongTensor(np.array(seq_b)).to(device)
         prediction = model.predict(states, np.array(len_seq_b), diff)
         _, topK = prediction.topk(100, dim=1, largest=True, sorted=True)
         topK = topK.cpu().detach().numpy()
-        sorted_list2=np.flip(topK,axis=1)
-        sorted_list2 = sorted_list2
-        calculate_hit(sorted_list2,topk,target_b,hit_purchase,ndcg_purchase)
-
-        total_purchase+=batch_size
- 
+        sorted_list2 = np.flip(topK, axis=1)
+        calculate_hit(sorted_list2, topk, target_b, hit_purchase, ndcg_purchase)
+        total_purchase += batch_size
 
     hr_list = []
     ndcg_list = []
     print('{:<10s} {:<10s} {:<10s} {:<10s} {:<10s} {:<10s}'.format('HR@'+str(topk[0]), 'NDCG@'+str(topk[0]), 'HR@'+str(topk[1]), 'NDCG@'+str(topk[1]), 'HR@'+str(topk[2]), 'NDCG@'+str(topk[2])))
     for i in range(len(topk)):
-        hr_purchase=hit_purchase[i]/total_purchase
-        ng_purchase=ndcg_purchase[i]/total_purchase
-
+        hr_purchase = hit_purchase[i] / total_purchase
+        ng_purchase = ndcg_purchase[i] / total_purchase
         hr_list.append(hr_purchase)
         ndcg_list.append(ng_purchase[0,0])
-
         if i == 1:
             hr_20 = hr_purchase
-
-    print('{:<10.6f} {:<10.6f} {:<10.6f} {:<10.6f} {:<10.6f} {:<10.6f}'.format(hr_list[0], (ndcg_list[0]), hr_list[1], (ndcg_list[1]), hr_list[2], (ndcg_list[2])))
-
+    print('{:<10.6f} {:<10.6f} {:<10.6f} {:<10.6f} {:<10.6f} {:<10.6f}'.format(hr_list[0], ndcg_list[0], hr_list[1], ndcg_list[1], hr_list[2], ndcg_list[2]))
     return hr_20
+
+
+DDBC_CAND_DIR = "/home/sjj/wenhao/DDBC_f-main/datasets/Yelp"
+
+
+def _load_or_build_candidate_pool(labels_list, item_num, multiplier, predict_n, seed, cache_path):
+    """
+    为每个评估样本构建候选集，与 DDBC 逻辑完全一致。
+
+    候选集 = unique(labels) 的 item IDs + multiplier×predict_n 个随机负样本
+    总大小 = |unique_labels| + multiplier×predict_n
+    （因 Yelp 10-item window 中 label 几乎不重复，实际 = predict_n + predict_n×multiplier）
+
+    注意：item ID 空间两边均为 0-based，无需转换。
+    """
+    if os.path.exists(cache_path):
+        print(f'[Candidate] Loading from {cache_path}')
+        with open(cache_path, 'rb') as f:
+            return pickle.load(f)['candidates']
+
+    print(f'[Candidate] Building valid pool: predict_n={predict_n}, multiplier={multiplier}, '
+          f'n_samples={len(labels_list)}')
+    rng     = np.random.RandomState(seed)
+    all_ids = np.arange(item_num)
+    candidate_pool = []
+    for label_list in labels_list:
+        unique_labels = list(set(label_list))       # 与 DDBC 一致：去重后放入候选集
+        mask          = np.ones(item_num, dtype=bool)
+        for lid in unique_labels:
+            mask[lid] = False
+        n_random     = predict_n * multiplier       # 与 DDBC 一致：random 数量 = predict_n × mult
+        random_items = rng.choice(all_ids[mask], size=n_random, replace=False).tolist()
+        candidate_pool.append(unique_labels + random_items)
+
+    os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
+    with open(cache_path, 'wb') as f:
+        pickle.dump({'metadata': {'seed': seed, 'multiplier': multiplier,
+                                  'predict_n': predict_n, 'num_samples': len(labels_list)},
+                     'candidates': candidate_pool}, f)
+    print(f'[Candidate] Saved to {cache_path}')
+    return candidate_pool
+
+
+def _seq_mode_metrics(pred_items, label_list):
+    """
+    Sequence mode 指标（allow_duplicate_items=True），与 DDBC 评估逻辑完全一致。
+    pred_items : list of predict_n item IDs（DreamRec 预测，无重复）
+    label_list : list of predict_n item IDs（可能含重复）
+    返回 dict: recall, precision, hit_1~5, jaccard
+    """
+    pred_counter  = Counter(pred_items)
+    label_counter = Counter(label_list)
+    all_keys      = set(pred_counter) | set(label_counter)
+
+    # 交集（multiset）：sum(min(p, l))
+    intersection = sum(min(pred_counter[k], label_counter[k]) for k in label_counter)
+    # 并集（multiset）：sum(max(p, l))
+    union        = sum(max(pred_counter[k], label_counter[k]) for k in all_keys)
+
+    total_label = sum(label_counter.values())   # = predict_n（含重复）
+    total_pred  = sum(pred_counter.values())    # = predict_n（无重复）
+
+    recall    = intersection / total_label if total_label > 0 else 0.0
+    precision = intersection / total_pred  if total_pred  > 0 else 0.0
+    jaccard   = intersection / union       if union       > 0 else 0.0
+
+    # hit_n：是否命中 ≥ n 个 label
+    hits = {f'hit_{n}': (1 if intersection >= n else 0) for n in range(1, 6)}
+    return {'recall': recall, 'precision': precision, **hits, 'jaccard': jaccard}
+
+
+def evaluate_ddbc(model, diff, device,
+                  predict_nums, multipliers, seed,
+                  writer=None, epoch=None, split='test'):
+    """
+    DDBC 兼容评估（与 DDBC evaluator.py 逻辑对齐）。
+
+    数据文件：{split}_data_items{predict_n}.df
+      - seq     : [SEQ_SIZE] 历史序列（PAD=item_num）
+      - len_seq : 有效历史长度
+      - labels  : [predict_n] 个真实 label item（可能含重复）
+
+    候选集：
+      - test : 直接使用 DDBC 已生成的 test_candidates_seed1_x{mult}_items{n}.pkl
+      - valid : 自动生成并缓存到 data/yelp/valid_candidates_seed{seed}_x{mult}_items{n}.pkl
+
+    指标：recall, precision, hit_1~5, jaccard（sequence mode，Counter 计算，与 DDBC 一致）
+    """
+    batch_size  = 100
+    all_results = {}
+
+    for predict_n in predict_nums:
+        # --- 加载评估数据 ---
+        data_path = os.path.join(data_directory, f'{split}_data_items{predict_n}.df')
+        eval_data = pd.read_pickle(data_path)
+        seq       = list(eval_data['seq'].values)
+        len_seq   = list(eval_data['len_seq'].values)
+        labels    = list(eval_data['labels'].values)
+        num_total = len(seq)
+
+        for multiplier in multipliers:
+            # --- 确定候选集文件路径 ---
+            if split == 'test':
+                # 直接复用 DDBC 已生成的测试候选集（seed=1，与 DDBC 完全一致）
+                cand_path = os.path.join(
+                    DDBC_CAND_DIR,
+                    f'test_candidates_seed1_x{multiplier}_items{predict_n}.pkl'
+                )
+            else:
+                # valid 候选集：自动生成并缓存
+                cand_path = os.path.join(
+                    data_directory,
+                    f'valid_candidates_seed{seed}_x{multiplier}_items{predict_n}.pkl'
+                )
+
+            candidate_pool = _load_or_build_candidate_pool(
+                labels, item_num, multiplier, predict_n, seed, cand_path
+            )
+
+            # --- 批量打分 ---
+            metric_accum = {'recall': 0., 'precision': 0.,
+                            'hit_1': 0., 'hit_2': 0., 'hit_3': 0.,
+                            'hit_4': 0., 'hit_5': 0., 'jaccard': 0.}
+            n_valid = 0
+
+            model.eval()
+            with torch.no_grad():
+                n_batches = (num_total + batch_size - 1) // batch_size
+                for bi in range(n_batches):
+                    s          = slice(bi * batch_size, min((bi + 1) * batch_size, num_total))
+                    states     = torch.LongTensor(np.array(seq[s])).to(device)
+                    len_states = np.array(len_seq[s])
+                    cands_b    = candidate_pool[s.start:s.stop]   # list of lists (variable length)
+
+                    # Pad to uniform length within batch to handle variable-length candidate lists
+                    max_cand_len = max(len(c) for c in cands_b)
+                    padded_cands = [c + [0] * (max_cand_len - len(c)) for c in cands_b]
+                    cand_ids   = torch.LongTensor(np.array(padded_cands)).to(device)
+
+                    scores_np  = model.predict(states, len_states, diff,
+                                               candidate_ids=cand_ids).detach().cpu().numpy()
+
+                    # Mask padded positions so they won't be selected
+                    for j in range(len(cands_b)):
+                        actual_len = len(cands_b[j])
+                        if actual_len < max_cand_len:
+                            scores_np[j, actual_len:] = -np.inf
+
+                    for j in range(len(cands_b)):
+                        # 取 top-predict_n 的候选 item IDs
+                        top_indices = np.argsort(scores_np[j])[::-1][:predict_n]
+                        pred_items  = [cands_b[j][idx] for idx in top_indices]
+                        label_items = list(labels[s.start + j])
+
+                        m = _seq_mode_metrics(pred_items, label_items)
+                        for k in metric_accum:
+                            metric_accum[k] += m[k]
+                        n_valid += 1
+            model.train()
+
+            # 均值
+            result = {k: v / n_valid for k, v in metric_accum.items()}
+            all_results[(predict_n, multiplier)] = result
+
+    # --- 打印（与 DDBC output_results 格式对齐）---
+    print(f'\n[{split.upper()} DDBC metrics]')
+    for (predict_n, mult), m in sorted(all_results.items()):
+        tag = f'@{predict_n}_x{mult}'
+        print(f"  recall{tag}={m['recall']:.4f}  precision{tag}={m['precision']:.4f}  "
+              f"hit_1{tag}={m['hit_1']:.4f}  hit_2{tag}={m['hit_2']:.4f}  "
+              f"hit_3{tag}={m['hit_3']:.4f}  jaccard{tag}={m['jaccard']:.4f}")
+
+    # --- TensorBoard ---
+    if writer is not None and epoch is not None:
+        for (predict_n, mult), m in all_results.items():
+            prefix = f'{split}/x{mult}/top{predict_n}'
+            for metric_name, val in m.items():
+                writer.add_scalar(f'{prefix}/{metric_name}', val, epoch)
+
+    # 主指标：smallest multiplier 下 predict_n=3 的 recall（用于保存最优模型）
+    main_key = (predict_nums[0], multipliers[0])
+    return all_results.get(main_key, {}).get('recall', 0.0)
+
+
 
 
 if __name__ == '__main__':
 
-    # args = parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cuda)
 
     data_directory = './data/' + args.data
     data_statis = pd.read_pickle(
-        os.path.join(data_directory, 'data_statis.df'))  # read data statistics, includeing seq_size and item_num
-    seq_size = data_statis['seq_size'][0]  # the length of history to define the seq
-    item_num = data_statis['item_num'][0]  # total number of items
-    topk=[10, 20, 50]
+        os.path.join(data_directory, 'data_statis.df'))
+    seq_size = data_statis['seq_size'][0]
+    item_num = data_statis['item_num'][0]
+    topk = [10, 20, 50]
+
+    # --- 解析 DDBC 评估参数 ---
+    predict_nums  = [int(x) for x in args.predict_nums.split(',')]
+    multipliers   = [int(x) for x in args.candidate_multipliers.split(',')]
+    eval_seed     = args.random_seed
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    timesteps = args.timesteps
 
-
-    model = Tenc(args.hidden_factor,item_num, seq_size, args.dropout_rate, args.diffuser_type, device)
-    diff = diffusion(args.timesteps, args.beta_start, args.beta_end, args.w)
+    model = Tenc(args.hidden_factor, item_num, seq_size, args.dropout_rate, args.diffuser_type, device)
+    diff  = diffusion(args.timesteps, args.beta_start, args.beta_end, args.w)
 
     if args.optimizer == 'adam':
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-8, weight_decay=args.l2_decay)
-    elif args.optimizer =='adamw':
+    elif args.optimizer == 'adamw':
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, eps=1e-8, weight_decay=args.l2_decay)
-    elif args.optimizer =='adagrad':
+    elif args.optimizer == 'adagrad':
         optimizer = torch.optim.Adagrad(model.parameters(), lr=args.lr, eps=1e-8, weight_decay=args.l2_decay)
-    elif args.optimizer =='rmsprop':
+    elif args.optimizer == 'rmsprop':
         optimizer = torch.optim.RMSprop(model.parameters(), lr=args.lr, eps=1e-8, weight_decay=args.l2_decay)
 
-    # scheduler = lr_scheduler.LinearLR(optimizer, start_factor=0.1, end_factor=1, total_iters=20)
-    
     model.to(device)
-    # optimizer.to(device)
+
+    # --- TensorBoard ---
+    descri = args.descri if args.descri else f'{args.data}-t{args.timesteps}-lr{args.lr}-w{args.w}'
+    tb_log_dir = args.tb_log_dir if args.tb_log_dir else f'./tensorboard/{args.data}/{descri}'
+    writer = SummaryWriter(log_dir=tb_log_dir)
+    print(f'TensorBoard log dir: {tb_log_dir}')
+
+    # --- 模型保存目录 ---
+    save_dir = args.save_dir if args.save_dir else f'./outputs/{args.data}/{descri}'
+    os.makedirs(save_dir, exist_ok=True)
 
     train_data = pd.read_pickle(os.path.join(data_directory, 'train_data.df'))
 
-    total_step=0
-    hr_max = 0
+    best_val_recall = 0.0
     best_epoch = 0
+    num_rows    = train_data.shape[0]
+    num_batches = int(num_rows / args.batch_size)
 
-    num_rows=train_data.shape[0]
-    num_batches=int(num_rows/args.batch_size)
     for i in range(args.epoch):
         start_time = Time.time()
+        model.train()
+        epoch_loss = 0.0
         for j in range(num_batches):
-            batch = train_data.sample(n=args.batch_size).to_dict()
-            seq = list(batch['seq'].values())
+            batch  = train_data.sample(n=args.batch_size).to_dict()
+            seq    = list(batch['seq'].values())
             len_seq = list(batch['len_seq'].values())
-            target=list(batch['next'].values())
+            target = list(batch['next'].values())
 
             optimizer.zero_grad()
-            seq = torch.LongTensor(seq)
-            len_seq = torch.LongTensor(len_seq)
-            target = torch.LongTensor(target)
-
-            seq = seq.to(device)
-            target = target.to(device)
-            len_seq = len_seq.to(device)
-
+            seq     = torch.LongTensor(seq).to(device)
+            len_seq = torch.LongTensor(len_seq).to(device)
+            target  = torch.LongTensor(target).to(device)
 
             x_start = model.cacu_x(target)
-
             h = model.cacu_h(seq, len_seq, args.p)
-
-            n = torch.randint(0, args.timesteps, (args.batch_size, ), device=device).long()
+            n = torch.randint(0, args.timesteps, (args.batch_size,), device=device).long()
             loss, predicted_x = diff.p_losses(model, x_start, h, n, loss_type='l2')
 
             loss.backward()
             optimizer.step()
+            epoch_loss += loss.item()
 
+        avg_loss = epoch_loss / num_batches
+        writer.add_scalar('train/loss', avg_loss, i)
 
-        # scheduler.step()
         if args.report_epoch:
-            if i % 1 == 0:
-                print("Epoch {:03d}; ".format(i) + 'Train loss: {:.4f}; '.format(loss) + "Time cost: " + Time.strftime(
-                        "%H: %M: %S", Time.gmtime(Time.time()-start_time)))
+            print("Epoch {:03d}; ".format(i) + 'Train loss: {:.4f}; '.format(avg_loss) +
+                  "Time cost: " + Time.strftime("%H: %M: %S", Time.gmtime(Time.time() - start_time)))
 
-            if (i + 1) % 10 == 0:
-                
-                eval_start = Time.time()
-                print('-------------------------- VAL PHRASE --------------------------')
-                _ = evaluate(model, 'valid_data.df', diff, device)
-                print('-------------------------- TEST PHRASE -------------------------')
-                _ = evaluate(model, 'test_data.df', diff, device)
-                print("Evalution cost: " + Time.strftime("%H: %M: %S", Time.gmtime(Time.time()-eval_start)))
-                print('----------------------------------------------------------------')
+        if (i + 1) % args.eval_freq == 0:
+            eval_start = Time.time()
+
+            print('-------------------------- VAL PHRASE --------------------------')
+            val_recall = evaluate_ddbc(
+                model, diff, device,
+                predict_nums, multipliers, eval_seed,
+                writer=writer, epoch=i, split='valid'
+            )
+
+            print('-------------------------- TEST PHRASE -------------------------')
+            evaluate_ddbc(
+                model, diff, device,
+                predict_nums, multipliers, eval_seed,
+                writer=writer, epoch=i, split='test'
+            )
+
+            print("Evaluation cost: " + Time.strftime("%H: %M: %S", Time.gmtime(Time.time() - eval_start)))
+            print('----------------------------------------------------------------')
+
+            # 保存最优模型
+            if val_recall > best_val_recall:
+                best_val_recall = val_recall
+                best_epoch = i
+                ckpt_path = os.path.join(save_dir, 'best_model.pt')
+                torch.save({'epoch': i, 'model_state_dict': model.state_dict(),
+                            'val_recall': val_recall}, ckpt_path)
+                print(f'[Saved] Best model at epoch {i}, val_recall={val_recall:.4f} → {ckpt_path}')
+
+    writer.close()
+    print(f'\nTraining done. Best epoch={best_epoch}, val_recall@{predict_nums[0]}_x{multipliers[0]}={best_val_recall:.4f}')
+
+    # 用最优 checkpoint 在 test 上跑完整 8 组结果
+    ckpt_path = os.path.join(save_dir, 'best_model.pt')
+    if os.path.exists(ckpt_path):
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt['model_state_dict'])
+        print(f'\n========== BEST MODEL TEST (epoch={ckpt["epoch"]}, '
+              f'val_recall={ckpt["val_recall"]:.4f}) ==========')
+        evaluate_ddbc(model, diff, device,
+                      predict_nums, multipliers, eval_seed,
+                      writer=None, epoch=None, split='test')
+        print('=' * 60)
+
 
 
 
