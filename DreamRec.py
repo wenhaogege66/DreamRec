@@ -68,6 +68,11 @@ def parse_args():
                         help='Comma-separated candidate multipliers; pool_size = 1 + multiplier')
     parser.add_argument('--eval_freq', type=int, default=10,
                         help='Run DDBC-style evaluation every N epochs')
+    parser.add_argument('--predict_mode', type=str, default='single',
+                        choices=['single', 'ar'],
+                        help='Prediction mode: '
+                             'single=one-shot diffusion → top-k; '
+                             'ar=autoregressive diffusion top-1 × k (update history each step)')
     parser.add_argument('--tb_log_dir', type=str, default='',
                         help='TensorBoard log directory (default: ./tensorboard/{data}/{descri})')
     parser.add_argument('--save_dir', type=str, default='',
@@ -523,7 +528,7 @@ def _seq_mode_metrics(pred_items, label_list):
 
 def evaluate_ddbc(model, diff, device,
                   predict_nums, multipliers, seed,
-                  writer=None, epoch=None, split='test'):
+                  writer=None, epoch=None, split='test', predict_mode='single'):
     """
     DDBC 兼容评估（与 DDBC evaluator.py 逻辑对齐）。
 
@@ -589,25 +594,80 @@ def evaluate_ddbc(model, diff, device,
                     padded_cands = [c + [0] * (max_cand_len - len(c)) for c in cands_b]
                     cand_ids   = torch.LongTensor(np.array(padded_cands)).to(device)
 
-                    scores_np  = model.predict(states, len_states, diff,
-                                               candidate_ids=cand_ids).detach().cpu().numpy()
+                    if predict_mode == 'ar':
+                        # ── 自回归模式 ──────────────────────────────────────────
+                        # 每步：扩散推理 → top-1 → 追加到历史 → 从候选集移除 → 下一步
+                        batch_actual = s.stop - s.start
+                        curr_seqs = np.array(seq[s.start:s.stop], dtype=np.int64).copy()   # [B, seq_size]
+                        curr_lens = np.array(len_seq[s.start:s.stop], dtype=np.int64).copy()  # [B]
+                        remaining_cands = [list(c) for c in cands_b]   # mutable per-sample lists
+                        pred_items_batch = [[] for _ in range(batch_actual)]
 
-                    # Mask padded positions so they won't be selected
-                    for j in range(len(cands_b)):
-                        actual_len = len(cands_b[j])
-                        if actual_len < max_cand_len:
-                            scores_np[j, actual_len:] = -np.inf
+                        for step in range(predict_n):
+                            # 构造当前候选集 tensor（每步候选数比上一步少1）
+                            max_cand_step = max(len(c) for c in remaining_cands)
+                            padded_step = [c + [0] * (max_cand_step - len(c)) for c in remaining_cands]
+                            cand_ids_step = torch.LongTensor(np.array(padded_step)).to(device)
+                            states_step   = torch.LongTensor(curr_seqs).to(device)
 
-                    for j in range(len(cands_b)):
-                        # 取 top-predict_n 的候选 item IDs
-                        top_indices = np.argsort(scores_np[j])[::-1][:predict_n]
-                        pred_items  = [cands_b[j][idx] for idx in top_indices]
-                        label_items = list(labels[s.start + j])
+                            scores_step = model.predict(
+                                states_step, curr_lens, diff,
+                                candidate_ids=cand_ids_step
+                            ).detach().cpu().numpy()
 
-                        m = _seq_mode_metrics(pred_items, label_items)
-                        for k in metric_accum:
-                            metric_accum[k] += m[k]
-                        n_valid += 1
+                            # Mask padding
+                            for j in range(batch_actual):
+                                actual_len = len(remaining_cands[j])
+                                if actual_len < max_cand_step:
+                                    scores_step[j, actual_len:] = -np.inf
+
+                            # top-1 per sample → update history & candidate pool
+                            for j in range(batch_actual):
+                                best_idx  = int(np.argmax(scores_step[j]))
+                                best_item = remaining_cands[j][best_idx]
+                                pred_items_batch[j].append(best_item)
+
+                                # 从候选集移除（避免重复预测）
+                                remaining_cands[j].pop(best_idx)
+
+                                # 追加到历史序列
+                                pos = int(curr_lens[j])
+                                if pos < seq_size:
+                                    curr_seqs[j, pos] = best_item
+                                    curr_lens[j] += 1
+                                else:
+                                    # 历史已满：左移一位，末尾追加
+                                    curr_seqs[j, :-1] = curr_seqs[j, 1:]
+                                    curr_seqs[j, -1]  = best_item
+                                    # curr_lens 保持 seq_size 不变
+
+                        for j in range(batch_actual):
+                            label_items = list(labels[s.start + j])
+                            m = _seq_mode_metrics(pred_items_batch[j], label_items)
+                            for k in metric_accum:
+                                metric_accum[k] += m[k]
+                            n_valid += 1
+
+                    else:
+                        # ── 单次推理模式（原始行为） ────────────────────────────
+                        scores_np = model.predict(states, len_states, diff,
+                                                  candidate_ids=cand_ids).detach().cpu().numpy()
+
+                        # Mask padded positions so they won't be selected
+                        for j in range(len(cands_b)):
+                            actual_len = len(cands_b[j])
+                            if actual_len < max_cand_len:
+                                scores_np[j, actual_len:] = -np.inf
+
+                        for j in range(len(cands_b)):
+                            top_indices = np.argsort(scores_np[j])[::-1][:predict_n]
+                            pred_items  = [cands_b[j][idx] for idx in top_indices]
+                            label_items = list(labels[s.start + j])
+
+                            m = _seq_mode_metrics(pred_items, label_items)
+                            for k in metric_accum:
+                                metric_accum[k] += m[k]
+                            n_valid += 1
             model.train()
 
             # 均值
@@ -723,14 +783,16 @@ if __name__ == '__main__':
             val_recall = evaluate_ddbc(
                 model, diff, device,
                 predict_nums, multipliers, eval_seed,
-                writer=writer, epoch=i, split='valid'
+                writer=writer, epoch=i, split='valid',
+                predict_mode=args.predict_mode
             )
 
             print('-------------------------- TEST PHRASE -------------------------')
             evaluate_ddbc(
                 model, diff, device,
                 predict_nums, multipliers, eval_seed,
-                writer=writer, epoch=i, split='test'
+                writer=writer, epoch=i, split='test',
+                predict_mode=args.predict_mode
             )
 
             print("Evaluation cost: " + Time.strftime("%H: %M: %S", Time.gmtime(Time.time() - eval_start)))
@@ -757,7 +819,8 @@ if __name__ == '__main__':
               f'val_recall={ckpt["val_recall"]:.4f}) ==========')
         evaluate_ddbc(model, diff, device,
                       predict_nums, multipliers, eval_seed,
-                      writer=None, epoch=None, split='test')
+                      writer=None, epoch=None, split='test',
+                      predict_mode=args.predict_mode)
         print('=' * 60)
 
 

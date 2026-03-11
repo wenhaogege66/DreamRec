@@ -40,6 +40,9 @@ def parse_args():
                    help='逗号分隔的候选集倍数列表')
     p.add_argument('--seed',                  type=int, default=1,
                    help='随机种子（test 候选集沿用 seed=1 与 DDBC 对齐）')
+    p.add_argument('--predict_mode',          type=str, default='single',
+                   choices=['single', 'ar'],
+                   help='single=one-shot top-k; ar=autoregressive top-1×k')
     return p.parse_args()
 
 
@@ -84,5 +87,6 @@ multipliers  = [int(x) for x in eval_args.candidate_multipliers.split(',')]
 print('\n========== TEST RESULTS (best model) ==========')
 DR.evaluate_ddbc(model, diff, device,
                  predict_nums, multipliers, eval_args.seed,
-                 writer=None, epoch=None, split='test')
+                 writer=None, epoch=None, split='test',
+                 predict_mode=eval_args.predict_mode)
 print('=' * 48)

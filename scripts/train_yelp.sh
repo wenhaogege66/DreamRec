@@ -31,7 +31,7 @@ echo "=================================================="
 DATA="yelp"                   # 数据集名称，对应 data/{DATA}/ 目录
 
 # --- 训练流程 ---
-EPOCH=100                    # 最大训练轮数
+EPOCH=75                    # 最大训练轮数
 BATCH_SIZE=256                # mini-batch 大小
 RANDOM_SEED=100               # 随机种子（影响参数初始化、batch采样等）
 
@@ -73,6 +73,10 @@ CANDIDATE_MULTIPLIERS="9,19,49,99"
                               # x9→10候选, x19→20候选, x49→50候选, x99→100候选
                               # 与 DDBC 的 test_candidates_seed*_x*_items*.pkl 对齐
 EVAL_FREQ=10                  # 每隔多少 epoch 做一次 DDBC 评估
+PREDICT_MODE="ar"         # 预测模式:
+                              #   single: 单次扩散推理 → top-k（原始 DreamRec 行为）
+                              #   ar:     自回归模式 — 每步扩散推理取 top-1，追加到历史，重复 k 次
+                              #           理论上更准确，但推理耗时约为 single 的 k 倍
 
 # =============================================================================
 # 开始训练
@@ -106,6 +110,7 @@ python -u "$PROJECT_DIR/DreamRec.py" \
     --predict_nums  "$PREDICT_NUMS"          \
     --candidate_multipliers "$CANDIDATE_MULTIPLIERS" \
     --eval_freq     $EVAL_FREQ               \
+    --predict_mode  "$PREDICT_MODE"          \
     --tb_log_dir    "$TB_LOG_DIR"            \
     --save_dir      "$SAVE_DIR"              \
     --cuda          $CUDA_VISIBLE_DEVICES    \

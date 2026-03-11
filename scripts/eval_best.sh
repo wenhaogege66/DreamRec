@@ -37,4 +37,5 @@ python -u eval_best.py \
     --w                  2           \
     --predict_nums       3,5         \
     --candidate_multipliers 9,19,49,99 \
-    --seed               1
+    --seed               1           \
+    --predict_mode       ar
