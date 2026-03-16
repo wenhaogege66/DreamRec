@@ -787,14 +787,6 @@ if __name__ == '__main__':
                 predict_mode=args.predict_mode
             )
 
-            print('-------------------------- TEST PHRASE -------------------------')
-            evaluate_ddbc(
-                model, diff, device,
-                predict_nums, multipliers, eval_seed,
-                writer=writer, epoch=i, split='test',
-                predict_mode=args.predict_mode
-            )
-
             print("Evaluation cost: " + Time.strftime("%H: %M: %S", Time.gmtime(Time.time() - eval_start)))
             print('----------------------------------------------------------------')
 

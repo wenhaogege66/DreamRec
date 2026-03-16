@@ -8,7 +8,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-CKPT="${1:-$PROJECT_DIR/outputs/yelp/dreamrec-yelp-20260308-224619/best_model.pt}"
+CKPT="${1:-$PROJECT_DIR/outputs/yelp/dreamrec-yelp-20260312-000247/best_model.pt}"
 
 # 检查 checkpoint 是否存在
 if [ ! -f "$CKPT" ]; then

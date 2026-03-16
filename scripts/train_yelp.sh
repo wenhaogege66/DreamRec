@@ -68,10 +68,8 @@ P=0.1                         # 训练时 context dropout 概率
 
 # --- DDBC 兼容评估 ---
 PREDICT_NUMS="3,5"          # 每次预测的 item 数，对应 DDBC 的 predict_num_items
-CANDIDATE_MULTIPLIERS="9,19,49,99"
-                              # 候选集倍数: pool_size = 1 + multiplier
-                              # x9→10候选, x19→20候选, x49→50候选, x99→100候选
-                              # 与 DDBC 的 test_candidates_seed*_x*_items*.pkl 对齐
+CANDIDATE_MULTIPLIERS="19"    # 训练期间 valid 只用 x19（单一倍数，避免重复 diffusion）
+                              # 完整 4 倍数评估（9/19/49/99）由 eval_best.sh 在训练结束后执行
 EVAL_FREQ=10                  # 每隔多少 epoch 做一次 DDBC 评估
 PREDICT_MODE="ar"         # 预测模式:
                               #   single: 单次扩散推理 → top-k（原始 DreamRec 行为）
