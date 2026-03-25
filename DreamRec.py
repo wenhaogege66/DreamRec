@@ -73,6 +73,8 @@ def parse_args():
                         help='Prediction mode: '
                              'single=one-shot diffusion → top-k; '
                              'ar=autoregressive diffusion top-1 × k (update history each step)')
+    parser.add_argument('--topk', type=int, default=1,
+                        help='K in SM@K: at each step, how many top candidates count as hit (default: 1)')
     parser.add_argument('--tb_log_dir', type=str, default='',
                         help='TensorBoard log directory (default: ./tensorboard/{data}/{descri})')
     parser.add_argument('--save_dir', type=str, default='',
@@ -503,32 +505,49 @@ def _seq_mode_metrics(pred_items, label_list):
     Sequence mode 指标（allow_duplicate_items=True），与 DDBC 评估逻辑完全一致。
     pred_items : list of predict_n item IDs（DreamRec 预测，无重复）
     label_list : list of predict_n item IDs（可能含重复）
-    返回 dict: recall, precision, hit_1~5, jaccard
     """
     pred_counter  = Counter(pred_items)
     label_counter = Counter(label_list)
-    all_keys      = set(pred_counter) | set(label_counter)
 
     # 交集（multiset）：sum(min(p, l))
     intersection = sum(min(pred_counter[k], label_counter[k]) for k in label_counter)
-    # 并集（multiset）：sum(max(p, l))
-    union        = sum(max(pred_counter[k], label_counter[k]) for k in all_keys)
 
-    total_label = sum(label_counter.values())   # = predict_n（含重复）
-    total_pred  = sum(pred_counter.values())    # = predict_n（无重复）
+    total_label = sum(label_counter.values())
+    total_pred  = sum(pred_counter.values())
 
     recall    = intersection / total_label if total_label > 0 else 0.0
     precision = intersection / total_pred  if total_pred  > 0 else 0.0
-    jaccard   = intersection / union       if union       > 0 else 0.0
 
     # hit_n：是否命中 ≥ n 个 label
     hits = {f'hit_{n}': (1 if intersection >= n else 0) for n in range(1, 6)}
-    return {'recall': recall, 'precision': precision, **hits, 'jaccard': jaccard}
+
+    # hit_full：预测集与标签集完全一致（multiset 相等）
+    hit_full = 1 if pred_counter == label_counter else 0
+
+    # Sequential Match metrics: binary membership check per label position
+    pred_set = set(pred_items)
+    T = len(label_list)
+    sh = sum(1 for y_t in label_list if y_t in pred_set)
+    sm = sh / T if T > 0 else 0.0
+
+    return {'recall': recall, 'precision': precision, **hits, 'hit_full': hit_full,
+            'sm': sm, 'sh': float(sh), 'sn': sm}
+
+
+def _stepwise_sm_metrics(step_hits, predict_n):
+    """
+    逐步 SM/SH/SN 指标（AR 模式专用）。
+    step_hits : list of predict_n 个 0/1 值，表示每步是否命中 top-K
+    predict_n : 预测步数（= len(step_hits)）
+    """
+    sh = sum(step_hits)
+    sm = sh / predict_n if predict_n > 0 else 0.0
+    return {'sm': sm, 'sh': float(sh), 'sn': sm}
 
 
 def evaluate_ddbc(model, diff, device,
                   predict_nums, multipliers, seed,
-                  writer=None, epoch=None, split='test', predict_mode='single'):
+                  writer=None, epoch=None, split='test', predict_mode='single', topk=1):
     """
     DDBC 兼容评估（与 DDBC evaluator.py 逻辑对齐）。
 
@@ -577,7 +596,8 @@ def evaluate_ddbc(model, diff, device,
             # --- 批量打分 ---
             metric_accum = {'recall': 0., 'precision': 0.,
                             'hit_1': 0., 'hit_2': 0., 'hit_3': 0.,
-                            'hit_4': 0., 'hit_5': 0., 'jaccard': 0.}
+                            'hit_4': 0., 'hit_5': 0., 'hit_full': 0.,
+                            'sm': 0., 'sh': 0., 'sn': 0.}
             n_valid = 0
 
             model.eval()
@@ -596,15 +616,15 @@ def evaluate_ddbc(model, diff, device,
 
                     if predict_mode == 'ar':
                         # ── 自回归模式 ──────────────────────────────────────────
-                        # 每步：扩散推理 → top-1 → 追加到历史 → 从候选集移除 → 下一步
+                        # 每步：扩散推理 → top-K 命中判断 + top-1 历史更新
                         batch_actual = s.stop - s.start
-                        curr_seqs = np.array(seq[s.start:s.stop], dtype=np.int64).copy()   # [B, seq_size]
-                        curr_lens = np.array(len_seq[s.start:s.stop], dtype=np.int64).copy()  # [B]
-                        remaining_cands = [list(c) for c in cands_b]   # mutable per-sample lists
+                        curr_seqs = np.array(seq[s.start:s.stop], dtype=np.int64).copy()
+                        curr_lens = np.array(len_seq[s.start:s.stop], dtype=np.int64).copy()
+                        remaining_cands = [list(c) for c in cands_b]
                         pred_items_batch = [[] for _ in range(batch_actual)]
+                        step_hits_batch = [[] for _ in range(batch_actual)]  # 记录每步 top-K 命中
 
                         for step in range(predict_n):
-                            # 构造当前候选集 tensor（每步候选数比上一步少1）
                             max_cand_step = max(len(c) for c in remaining_cands)
                             padded_step = [c + [0] * (max_cand_step - len(c)) for c in remaining_cands]
                             cand_ids_step = torch.LongTensor(np.array(padded_step)).to(device)
@@ -621,13 +641,25 @@ def evaluate_ddbc(model, diff, device,
                                 if actual_len < max_cand_step:
                                     scores_step[j, actual_len:] = -np.inf
 
-                            # top-1 per sample → update history & candidate pool
+                            # 逐样本处理：top-K 命中判断 + top-1 历史更新
                             for j in range(batch_actual):
+                                # 当前步的真实 label
+                                y_t = list(labels[s.start + j])[step]
+
+                                # 找 top-K 候选
+                                topk_indices = np.argsort(scores_step[j])[::-1][:topk]
+                                topk_items = [remaining_cands[j][idx] for idx in topk_indices]
+
+                                # 记录是否命中 top-K
+                                hit = 1 if y_t in topk_items else 0
+                                step_hits_batch[j].append(hit)
+
+                                # 取 top-1 用于历史更新（AR 逻辑）
                                 best_idx  = int(np.argmax(scores_step[j]))
                                 best_item = remaining_cands[j][best_idx]
                                 pred_items_batch[j].append(best_item)
 
-                                # 从候选集移除（避免重复预测）
+                                # 从候选集移除
                                 remaining_cands[j].pop(best_idx)
 
                                 # 追加到历史序列
@@ -636,14 +668,18 @@ def evaluate_ddbc(model, diff, device,
                                     curr_seqs[j, pos] = best_item
                                     curr_lens[j] += 1
                                 else:
-                                    # 历史已满：左移一位，末尾追加
                                     curr_seqs[j, :-1] = curr_seqs[j, 1:]
                                     curr_seqs[j, -1]  = best_item
-                                    # curr_lens 保持 seq_size 不变
 
+                        # 计算指标（recall/precision 用 pred_items，SM/SH/SN 用 step_hits）
                         for j in range(batch_actual):
                             label_items = list(labels[s.start + j])
                             m = _seq_mode_metrics(pred_items_batch[j], label_items)
+                            sm_metrics = _stepwise_sm_metrics(step_hits_batch[j], predict_n)
+
+                            # 用逐步 SM 覆盖原 SM
+                            m.update(sm_metrics)
+
                             for k in metric_accum:
                                 metric_accum[k] += m[k]
                             n_valid += 1
@@ -660,11 +696,23 @@ def evaluate_ddbc(model, diff, device,
                                 scores_np[j, actual_len:] = -np.inf
 
                         for j in range(len(cands_b)):
+                            # 取 top-predict_n 作为预测（用于 recall/precision）
                             top_indices = np.argsort(scores_np[j])[::-1][:predict_n]
                             pred_items  = [cands_b[j][idx] for idx in top_indices]
                             label_items = list(labels[s.start + j])
 
+                            # 计算 recall/precision/hit_full
                             m = _seq_mode_metrics(pred_items, label_items)
+
+                            # single 模式：所有步共享同一排名，逐步检查 top-K
+                            topk_indices = np.argsort(scores_np[j])[::-1][:topk]
+                            topk_items = [cands_b[j][idx] for idx in topk_indices]
+                            step_hits = [1 if y_t in topk_items else 0 for y_t in label_items]
+                            sm_metrics = _stepwise_sm_metrics(step_hits, predict_n)
+
+                            # 用逐步 SM 覆盖原 SM
+                            m.update(sm_metrics)
+
                             for k in metric_accum:
                                 metric_accum[k] += m[k]
                             n_valid += 1
@@ -680,7 +728,8 @@ def evaluate_ddbc(model, diff, device,
         tag = f'@{predict_n}_x{mult}'
         print(f"  recall{tag}={m['recall']:.4f}  precision{tag}={m['precision']:.4f}  "
               f"hit_1{tag}={m['hit_1']:.4f}  hit_2{tag}={m['hit_2']:.4f}  "
-              f"hit_3{tag}={m['hit_3']:.4f}  jaccard{tag}={m['jaccard']:.4f}")
+              f"hit_3{tag}={m['hit_3']:.4f}  hit_full{tag}={m['hit_full']:.4f}  "
+              f"sm{tag}={m['sm']:.4f}  sh{tag}={m['sh']:.4f}  sn{tag}={m['sn']:.4f}")
 
     # --- TensorBoard ---
     if writer is not None and epoch is not None:
@@ -784,7 +833,7 @@ if __name__ == '__main__':
                 model, diff, device,
                 predict_nums, multipliers, eval_seed,
                 writer=writer, epoch=i, split='valid',
-                predict_mode=args.predict_mode
+                predict_mode='single', topk=args.topk
             )
 
             print("Evaluation cost: " + Time.strftime("%H: %M: %S", Time.gmtime(Time.time() - eval_start)))
@@ -812,7 +861,7 @@ if __name__ == '__main__':
         evaluate_ddbc(model, diff, device,
                       predict_nums, multipliers, eval_seed,
                       writer=None, epoch=None, split='test',
-                      predict_mode=args.predict_mode)
+                      predict_mode=args.predict_mode, topk=args.topk)
         print('=' * 60)
 
 

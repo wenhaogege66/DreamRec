@@ -8,7 +8,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-CKPT="${1:-$PROJECT_DIR/outputs/yelp/dreamrec-yelp-20260312-000247/best_model.pt}"
+CKPT="${1:-$PROJECT_DIR/outputs/yelp/dreamrec-yelp-20260320-194640/best_model.pt}"
 
 # 检查 checkpoint 是否存在
 if [ ! -f "$CKPT" ]; then
@@ -34,8 +34,8 @@ python -u eval_best.py \
     --beta_sche          exp         \
     --beta_start         0.0001      \
     --beta_end           0.02        \
-    --w                  2           \
-    --predict_nums       3,5         \
-    --candidate_multipliers 9,19,49,99 \
+    --w                  10           \
+    --predict_nums       3         \
+    --candidate_multipliers 19 \
     --seed               1           \
     --predict_mode       ar

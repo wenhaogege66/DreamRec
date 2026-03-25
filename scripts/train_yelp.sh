@@ -52,7 +52,7 @@ OPTIMIZER="adamw"             # 优化器类型: adam / adamw / adagrad / rmspro
 LR=0.001                      # 学习率
 
 # --- 扩散过程 ---
-TIMESTEPS=500                 # 扩散步数 T: 越大去噪越精细但推理越慢
+TIMESTEPS=500                 # 扩散步数 T: 越大去噪越精细但推理越慢 （1000,2000）
                               #   yc 论文用 500，ks 用 2000，zhihu 用 500
 BETA_SCHE="exp"               # 噪声调度策略:
                               #   exp:    指数增长（yc/zhihu 默认，收敛稳定）
@@ -63,18 +63,19 @@ BETA_START=0.0001             # 仅 linear 调度时生效，beta 起始值
 BETA_END=0.02                 # 仅 linear 调度时生效，beta 终止值
 
 # --- Classifier-Free Guidance ---
-W=2                           # 引导强度 w
+W=10                           # 引导强度 w
 P=0.1                         # 训练时 context dropout 概率
 
 # --- DDBC 兼容评估 ---
-PREDICT_NUMS="3,5"          # 每次预测的 item 数，对应 DDBC 的 predict_num_items
+PREDICT_NUMS="3"          # 每次预测的 item 数，对应 DDBC 的 predict_num_items
 CANDIDATE_MULTIPLIERS="19"    # 训练期间 valid 只用 x19（单一倍数，避免重复 diffusion）
                               # 完整 4 倍数评估（9/19/49/99）由 eval_best.sh 在训练结束后执行
-EVAL_FREQ=10                  # 每隔多少 epoch 做一次 DDBC 评估
-PREDICT_MODE="ar"         # 预测模式:
+EVAL_FREQ=5                   # 每隔多少 epoch 做一次 DDBC 评估（valid 固定 single 模式，约 50s/次）
+PREDICT_MODE="single"         # 预测模式:
                               #   single: 单次扩散推理 → top-k（原始 DreamRec 行为）
                               #   ar:     自回归模式 — 每步扩散推理取 top-1，追加到历史，重复 k 次
                               #           理论上更准确，但推理耗时约为 single 的 k 倍
+TOPK=1                        # SM@K 的 K：每步取前 K 名候选判断是否命中（独立于 PREDICT_NUMS）
 
 # =============================================================================
 # 开始训练
@@ -109,6 +110,7 @@ python -u "$PROJECT_DIR/DreamRec.py" \
     --candidate_multipliers "$CANDIDATE_MULTIPLIERS" \
     --eval_freq     $EVAL_FREQ               \
     --predict_mode  "$PREDICT_MODE"          \
+    --topk          $TOPK                    \
     --tb_log_dir    "$TB_LOG_DIR"            \
     --save_dir      "$SAVE_DIR"              \
     --cuda          $CUDA_VISIBLE_DEVICES    \
