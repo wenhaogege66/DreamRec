@@ -459,7 +459,7 @@ def evaluate(model, test_data, diff, device):
     return hr_20
 
 
-DDBC_CAND_DIR = "/home/sjj/wenhao/DDBC_f-main/datasets/Yelp"
+DDBC_CAND_DIR = "/home/sjj/wenhao/DISCO/datasets/Yelp"
 
 
 def _load_or_build_candidate_pool(labels_list, item_num, multiplier, predict_n, seed, cache_path):
